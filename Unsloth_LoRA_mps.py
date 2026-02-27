@@ -21,7 +21,7 @@ from transformers import (
 
 # ================= 配置区域 =================
 MODEL_ID = "/Users/hank/Desktop/Qwen3-8b"
-DATA_PATH = "/Users/hank/PycharmProjects/PythonProject1/LLM1/try_qwen.json"
+DATA_PATH = "/Users/hank/Downloads/qwen.json"
 OUTPUT_DIR = "./unsloth_lora_output"
 
 MAX_SEQ_LENGTH = 256
@@ -122,6 +122,33 @@ def build_qwen_messages(example: Dict[str, Any]) -> List[Dict[str, str]]:
             {"role": "assistant", "content": answer},
         ]
     return []
+
+
+def expand_multiturn_to_sft_rows(raw_ds: Dataset) -> Dataset:
+    rows: List[Dict[str, Any]] = []
+    for example in raw_ds:
+        messages = build_qwen_messages(cast(Dict[str, Any], example))
+        if not messages:
+            continue
+
+        # 将一条多轮对话拆分为多条样本：每个 assistant 回答都成为一个监督目标。
+        built = 0
+        for idx, msg in enumerate(messages):
+            if msg["role"] != "assistant":
+                continue
+            prefix = messages[: idx + 1]
+            if any(m["role"] == "user" for m in prefix[:-1]):
+                rows.append({"messages": prefix})
+                built += 1
+
+        # 兜底：若没有可拆分 assistant，但存在问答结构，保留原样本。
+        if built == 0 and messages[-1]["role"] == "assistant":
+            if any(m["role"] == "user" for m in messages[:-1]):
+                rows.append({"messages": messages})
+
+    if not rows:
+        raise ValueError("数据集中未找到可用于 SFT 的 messages 样本。")
+    return Dataset.from_list(rows)
 
 
 def encode_chat_example(tokenizer: Any, example: Dict[str, Any]) -> Dict[str, List[int]]:
@@ -378,9 +405,10 @@ def main() -> None:
         raise FileNotFoundError(f"找不到数据文件: {DATA_PATH}")
 
     raw_ds = cast(Dataset, load_dataset("json", data_files=DATA_PATH, split="train"))
-    tokenized_all = raw_ds.map(
+    expanded_ds = expand_multiturn_to_sft_rows(raw_ds)
+    tokenized_all = expanded_ds.map(
         lambda x: encode_chat_example(tokenizer, x),
-        remove_columns=raw_ds.column_names,
+        remove_columns=expanded_ds.column_names,
     )
     tokenized_all = tokenized_all.filter(
         lambda x: len(x["input_ids"]) > 0 and any(t != -100 for t in x["labels"])
@@ -388,14 +416,16 @@ def main() -> None:
     if len(tokenized_all) == 0:
         raise ValueError("样本量不足：训练集为空。")
 
-    dropped = len(raw_ds) - len(tokenized_all)
+    dropped = len(expanded_ds) - len(tokenized_all)
     shuffled = tokenized_all.shuffle(seed=SEED)
     train_samples = shuffled
     sample_eval_size = min(EVAL_SAMPLE_SIZE, len(train_samples))
     eval_samples = train_samples.select(range(sample_eval_size))
 
     print(
-        f"有效训练样本: {len(train_samples)} | 丢弃样本: {dropped} | 抽样评估样本: {len(eval_samples)}"
+        f"原始对话: {len(raw_ds)} | 展开样本: {len(expanded_ds)} | "
+        f"有效训练样本: {len(train_samples)} | 丢弃样本: {dropped} | "
+        f"抽样评估样本: {len(eval_samples)}"
     )
 
     data_collator = DataCollatorForSeq2Seq(
